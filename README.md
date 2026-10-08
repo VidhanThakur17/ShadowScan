@@ -1,0 +1,563 @@
+# ShadowScan: HTTP Asset Monitoring & Delta Intelligence
+
+> **Authorized use only.** Run ShadowScan only against systems you own or are explicitly
+> authorized to test, such as targets listed in scope for a bug bounty program you take part in.
+> This module does lightweight, passive monitoring: one GET per target (plus in-scope redirects),
+> with bounded concurrency. It does no brute forcing, crawling, or exploitation.
+
+ShadowScan probes thousands of in-scope hosts concurrently and fingerprints each response. It
+stores every observation in SQLite and reports what changed since the last run. It also judges
+**which changes are worth a human's attention**: it suppresses dynamic-token noise, measures how
+much content changed, flags notable HTTP transitions, and ranks every change by `review_priority`.
+
+## Architecture
+
+```
+domains.txt ─► utils.parse_targets ─► Scanner
+             (normalize, host identity,  │
+              merge scheme intent)       ├─ producer: Semaphore(concurrency) → probe tasks
+                                         │     └─ HttpProber (one shared aiohttp ClientSession)
+                                         │          manual redirects + scope check per hop
+                                         │          ephemeral per-probe cookie jar
+                                         │          body streamed → FingerprintEngine (≤ MAX_RESPONSE_BYTES)
+                                         │              raw_sha256 + normalized_sha256 + similarity sketch
+                                         │              (large bodies finalized in a worker thread)
+                                         │
+                                         ├─ bounded asyncio.Queue (backpressure)
+                                         │
+                                         └─ writer task → batches → one DB thread → SQLite (WAL)
+                                                 per batch, in ONE transaction, per result:
+                                                 asset (by key) → previous + baseline obs (PK lookups)
+                                                 → compare_content (similarity only if changed)
+                                                 → detect_changes → scoring.assess
+                                                 → insert observation/fingerprints/changes
+                                                 → update asset pointers + history counters
+                                                                           │
+                                                    deltas.json (this run, sorted by review_priority)
+                                                    + console summary (top changes)
+```
+
+| Module | Responsibility |
+|---|---|
+| `config.py` | Defaults (`MAX_CONCURRENCY`, similarity thresholds, …) and the `ScanConfig` dataclass |
+| `models.py` | `Target`, `ProbeResult`, `Change`, `AssetHistory`, `ErrorType`, `ChangeType`, `RunSummary` |
+| `utils.py` | Target normalization, host-based identity, de-duplication, redirect `ScopePolicy`, logging |
+| `http_probe.py` | Async probing, redirects, per-probe cookies, bounded body reads, error classification |
+| `fingerprint.py` | Pluggable fingerprinters: raw SHA-256, normalized SHA-256 plus similarity sketch, titles |
+| `normalization.py` | Conservative, rule-by-rule noise normalization |
+| `similarity.py` | Bounded content sketches and similarity |
+| `delta.py` | Change detection, content comparison, `deltas.json` |
+| `scoring.py` | `interesting` / `reason` / `review_priority` rules (all weights in one table) |
+| `database.py` | SQLite schema v2, WAL, batched transactions |
+| `scanner.py` | Producer/consumer orchestration and graceful shutdown |
+| `main.py` | CLI and console summary |
+
+## Installation
+
+Requires Python 3.12+.
+
+```bash
+python -m venv .venv
+# Windows: .venv\Scripts\activate    Linux/macOS: source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## Usage
+
+```bash
+python -m shadow_scan.main --input domains.txt
+
+python -m shadow_scan.main --input domains.txt --concurrency 150 --timeout 10 \
+    --database shadowscan.db --output deltas.json
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--input, -i` | `domains.txt` | Targets file |
+| `--database, -d` | `shadowscan.db` | SQLite database |
+| `--output, -o` | `deltas.json` | Delta report for this run |
+| `--concurrency, -c` | 100 | Max in-flight targets (also the connection pool size) |
+| `--timeout, -t` | 10 | Connect (incl. DNS) and per-read timeout, seconds |
+| `--total-timeout` | max(3×timeout, 30) | Hard ceiling per HTTP request |
+| `--max-bytes` | 5 MiB | Max body bytes read per response |
+| `--max-redirects` | 5 | Max in-scope redirect hops |
+| `--no-http-fallback` | off | Don't retry scheme-less targets over HTTP |
+| `--allow-subdomain-redirects` | off | Also follow redirects to subdomains of supplied hosts |
+| `--insecure` | off | Skip TLS certificate verification |
+| `-H 'Name: value'` | — | Extra header (repeatable), e.g. a program's researcher ID header |
+| `--user-agent` | `ShadowScan/0.1 …` | User-Agent |
+| `--verbose, -v` | off | Debug logging; prints every change live and lists all of them in the summary |
+
+Exit codes: `0` completed, `1` failed, `130` interrupted (Ctrl+C saves everything already
+collected, marks the run `interrupted` and still writes `deltas.json`).
+
+### Console summary
+
+```
+ShadowScan completed
+
+Targets:                 5,284
+Reachable:               4,103
+Unreachable:             1,181
+Incomplete:                 12
+Changes:                    42
+Interesting:                 9
+Noise suppressed:           57
+
+Top changes:
+
+[ 95]* admin.example.com     403 -> 200
+[ 80]* api-v2.example.com    newly reachable (HTTP 200)
+[ 60]  portal.example.com    major content change (similarity 0.23)
+[ 25]  www.example.com       title 'Home' -> 'Welcome'
+```
+
+Only the top `TOP_CHANGES_SHOWN` changes are listed. Live `[CHANGE]` log lines appear only for
+interesting changes or those with priority ≥ `CONSOLE_PRIORITY_THRESHOLD`. `--verbose` shows
+everything.
+
+## Asset identity
+
+An asset is identified by **`host[:port][/path]` without a scheme**, so `example.com` and
+`https://example.com` are the same asset and share one history. User intent is stored separately:
+
+| Stored | Where |
+|---|---|
+| hostname, explicit non-default port, path | `assets.hostname`, `assets.port`, `assets.path` |
+| original input line | `assets.original_input` |
+| requested scheme (`http`/`https`, or `NULL` = auto) | `assets.requested_scheme` |
+| scheme that actually answered | `observations.scheme` |
+| whether the HTTPS→HTTP fallback was used | `observations.fallback_used` |
+| final URL after in-scope redirects | `observations.final_url` |
+
+Rules:
+- An explicit scheme is always respected. `https://example.com` never falls back to HTTP.
+- A scheme-less target tries HTTPS first and falls back to HTTP only on a transport-level failure
+  (connection refused, connect timeout, connection error, TLS error).
+- When the input lists the same asset with and without a scheme, the **explicit scheme wins**.
+  Two different explicit schemes keep the first one and log a warning.
+- Editing `domains.txt` to change the scheme updates the asset's intent and keeps its history.
+
+## Observation completeness
+
+Each observation records two independent facts:
+
+| | `http_reachable` | `observation_complete` |
+|---|---|---|
+| HTTP 200, body fully read | true | true |
+| HTTP 200, body > `MAX_RESPONSE_BYTES` (`response_too_large`) | true | false |
+| Redirect loop / limit exceeded | true | false |
+| Body read failed after headers | true | false |
+| DNS failure / refused / TLS error / timeout | false | false |
+
+Availability changes use `http_reachable`. Content and title comparisons use **only complete
+observations**: the current probe is compared against the asset's most recent *complete*
+observation (its content baseline). A truncated or failed read is therefore never reported as a
+content change.
+
+## Fingerprints: raw vs normalized
+
+Every complete observation stores two fingerprints, in `observations` and in
+`observation_fingerprints`:
+
+- **`raw_sha256`** (`observations.body_sha256`): SHA-256 of the exact body bytes. It is never removed.
+- **`normalized_sha256`**: SHA-256 of a text body after conservative noise normalization.
+
+The normalizer (`normalization.py`) is an ordered list of small rules, each tested on its own:
+
+| Rule | What it neutralizes |
+|---|---|
+| `strip_html_comments` | `<!-- … -->` (render timestamps, cache IDs) |
+| `mask_csrf_tokens` | values of `<meta>`/`<input>` fields with exact token names (`csrf-token`, `authenticity_token`, `__VIEWSTATE`, …) |
+| `mask_nonces` | `nonce` / `data-nonce` attribute values inside tags |
+| `mask_request_ids` | opaque values in `data-request-id`-style attributes, `<meta name="trace-id">`, JSON `"requestId"`-style keys |
+| `mask_render_timestamps` | epoch/ISO values in `data-timestamp`-style attributes, `<meta name="generated-at">`, JSON `"serverTime"`-style keys |
+| `collapse_whitespace` | indentation and line-ending differences |
+
+These are **deliberately never normalized**: script/style `src`, links, form actions, cache-busting
+query strings (`app.js?v=…`), build/version/modified timestamps, hidden inputs with non-token names,
+and visible text. A change there may mean a new deployment or a new endpoint.
+
+**Binary responses** (images, PDFs, archives, or bodies containing NUL bytes): `normalized_sha256`
+equals `raw_sha256` (normalization is the identity), and there is no similarity sketch. **Text
+over `NORMALIZATION_MAX_BYTES`** gets no normalized hash, and comparisons fall back to raw-vs-raw.
+A normalized hash is never compared with a raw one.
+
+If the raw hash changed but the normalized hash did not, no delta is emitted. The run counts it as
+"noise suppressed" (`raw_only_changes_suppressed` in `deltas.json`).
+
+## Similarity
+
+`content_similarity` (0.0 to 1.0) measures how much the normalized text changed. 1.0 means
+effectively identical and 0.0 means nothing in common. It is computed only when the normalized hash
+changed, and only against the immediately previous complete observation.
+
+How it works: normalized text is tokenized into tags and words. Tokens are grouped into
+content-defined chunks, so an insertion doesn't shift every later chunk. Each chunk is hashed to 32
+bits, and the asset keeps **one** compact sketch of its current baseline in
+`asset_content_baselines` (about 4 bytes per 8 tokens). Similarity is
+`difflib.SequenceMatcher.quick_ratio()` over the two chunk sequences: a linear-time match ratio. It
+measures *how much* changed, not *where*. Texts larger than `SIMILARITY_MAX_BYTES` are not sketched,
+and their similarity is reported as not measured instead of estimated from a prefix.
+
+## Delta classifications
+
+| Type | When | Notes |
+|---|---|---|
+| `new_asset` | first observation of an asset | only event for that asset in the run |
+| `availability_changed` | `http_reachable` flipped | only event; old/new state attached |
+| `error_changed` | still unreachable, failure mode changed (e.g. `dns_failure → connection_refused`) | |
+| `status_changed` | status code changed | title/server/redirect/content differences are attached as `context`, not emitted separately |
+| `redirect_changed` | final `Location` changed | `host_changed` flag; a 3xx body change is folded into it |
+| `title_changed` | `<title>` changed vs the content baseline | complete observations only |
+| `server_header_changed` | `Server` header changed | |
+| `content_changed_minor` | normalized content changed, similarity ≥ `SIMILARITY_MAJOR_THRESHOLD` (0.80) | `magnitude`: `trivial` (≥ 0.98) or `minor` |
+| `content_changed_major` | similarity < 0.80, or not measurable (binary or very large text) | `magnitude`: `major` or `unmeasured` |
+
+## Interesting & review priority
+
+**`interesting` does NOT mean "vulnerable".** It means the state transition may deserve human
+review. `review_priority` (0–100) ranks how worthwhile a change is to look at first. It is
+deliberately *not* a severity, risk score or CVSS. All rules and weights are in `scoring.py`
+(`PRIORITY`).
+
+| Transition | Priority | Interesting |
+|---|---:|:---:|
+| 403 → 2xx | 95 | ✓ |
+| 401 → 2xx | 90 | ✓ |
+| 404/410 → 2xx | 85 | ✓ |
+| unreachable → reachable (2xx / other) | 80 / 65 | ✓ |
+| 5xx → 2xx | 70 | ✓ |
+| 3xx → 2xx (redirect → direct content) | 65 | ✓ |
+| major content change | 60 | |
+| 2xx → 401/403 | 55 | ✓ |
+| new asset (reachable) | 50 | |
+| `dns_failure` → other error (name now resolves) | 45 | ✓ |
+| content changed, magnitude unmeasured | 40 | |
+| 2xx → 5xx · redirect to a different host | 40 | |
+| reachable → unreachable · other status change | 35 | |
+| redirect destination changed | 30 | |
+| title changed · 2xx → 404/410 | 25 | |
+| other error → `dns_failure` | 20 | |
+| minor content change · new unreachable asset · other error change | 15 | |
+| server header changed | 10 | |
+| trivial content change (similarity ≥ 0.98) | 5 | |
+
+## Historical change ratio
+
+Each asset keeps running counters, updated in O(1) per observation and never computed by scanning
+history: `observations_count`, `content_comparisons` (pairs of complete observations compared),
+`content_change_count` (normalized content differed) and `last_content_change_at`.
+`change_ratio = content_change_count / content_comparisons` is included in every content delta's
+`history`. A page at 47/50 is probably naturally dynamic. Nothing is suppressed automatically yet;
+the metric is exposed for a later prioritization stage.
+
+## Example `deltas.json`
+
+```json
+{
+  "run_id": 3,
+  "run_timestamp": "2026-10-08T07:19:59.302Z",
+  "finished_at": "2026-10-08T07:19:59.327Z",
+  "status": "completed",
+  "duration_seconds": 0.04,
+  "targets_total": 5,
+  "targets_processed": 5,
+  "reachable": 5,
+  "unreachable": 0,
+  "incomplete_observations": 0,
+  "errors_by_type": {},
+  "changes_found": 3,
+  "interesting_changes": 2,
+  "raw_only_changes_suppressed": 1,
+  "changes_by_type": { "availability_changed": 1, "content_changed_major": 1, "status_changed": 1 },
+  "changes": [
+    {
+      "target": "admin.example.com",
+      "type": "status_changed",
+      "old_status": 404,
+      "new_status": 200,
+      "context": { "title": { "old": null, "new": "Admin console" },
+                   "content": { "similarity": 0.0, "magnitude": "major" } },
+      "interesting": true,
+      "reason": "Previously missing endpoint (404) now returns HTTP 200",
+      "review_priority": 85
+    },
+    {
+      "target": "api-v2.example.com",
+      "type": "availability_changed",
+      "old": { "state": "unreachable", "status_code": null, "error_type": "connection_timeout" },
+      "new": { "state": "reachable", "status_code": 200, "error_type": null, "title": "Home" },
+      "previous_checked_at": "2026-10-08T07:19:53.417Z",
+      "interesting": true,
+      "reason": "Previously unreachable host now responds (HTTP 200)",
+      "review_priority": 80
+    },
+    {
+      "target": "portal.example.com",
+      "type": "content_changed_major",
+      "similarity": 0.2285,
+      "magnitude": "major",
+      "old_normalized_hash": "7a59…", "new_normalized_hash": "482f…",
+      "old_raw_hash": "7cd4…", "new_raw_hash": "ee47…",
+      "baseline_checked_at": "2026-10-08T07:19:53.417Z",
+      "history": { "observations": 3, "content_comparisons": 2, "content_changes": 1, "change_ratio": 0.5 },
+      "interesting": false,
+      "reason": "Major content change",
+      "review_priority": 60
+    }
+  ]
+}
+```
+
+Changes are sorted by `review_priority` (highest first), then target, then type.
+
+## Database structure (schema v2)
+
+| Table | Purpose |
+|---|---|
+| `runs` | One row per run: status and counters (incl. `interesting_changes`, `raw_only_changes`, `incomplete`) |
+| `assets` | Host-based identity, intent (`requested_scheme`, `original_input`), pointers `last_observation_id` / `last_complete_observation_id`, history counters |
+| `observations` | Every probe: URLs, actual scheme, `fallback_used`, `http_reachable`, `observation_complete`, status, headers, sizes, `body_sha256` (raw), `normalized_sha256`, `content_similarity` + `content_baseline_observation_id`, title, redirect, timing, error |
+| `observation_fingerprints` | `(observation_id, name, value)`: `raw_sha256`, `normalized_sha256`, future strategies |
+| `asset_content_baselines` | One similarity sketch per asset (current baseline only; overwritten, so storage stays bounded) |
+| `changes` | Every delta with `interesting`, `review_priority`, `reason`, details JSON, links to current/previous observation |
+
+The database runs in WAL mode, with `synchronous=NORMAL` and foreign keys on. Change detection does
+primary-key lookups only, via the asset pointers. When content is unchanged, only the baseline
+pointer moves and the sketch blob isn't rewritten.
+
+**Migration policy:** `PRAGMA user_version` tracks the schema, and new databases are created at v2.
+Phase 1 (v1) databases are **refused with instructions** and are not migrated, because the
+identity change would require merging asset histories. Point `--database` at a new file and keep
+the old one for reference.
+
+```sql
+-- This run's interesting changes, highest priority first
+SELECT a.target, c.change_type, c.review_priority, c.reason
+FROM changes c JOIN assets a ON a.id = c.asset_id
+WHERE c.run_id = (SELECT MAX(id) FROM runs) AND c.interesting = 1
+ORDER BY c.review_priority DESC;
+
+-- Naturally dynamic pages
+SELECT target, content_change_count, content_comparisons,
+       ROUND(1.0 * content_change_count / content_comparisons, 2) AS change_ratio
+FROM assets WHERE content_comparisons >= 5 ORDER BY change_ratio DESC;
+```
+
+## Performance configuration
+
+Defaults live at the top of `shadow_scan/config.py`:
+
+```python
+MAX_CONCURRENCY = 100
+REQUEST_TIMEOUT = 10
+TOTAL_REQUEST_TIMEOUT = 30
+MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+MAX_REDIRECTS = 5
+DB_BATCH_SIZE = 200
+DB_FLUSH_INTERVAL = 2.0
+NORMALIZATION_MAX_BYTES = 1024 * 1024    # text above this: raw hash only
+SIMILARITY_MAX_BYTES = 512 * 1024        # normalized text above this: similarity not measured
+SIMILARITY_CHUNK_DIVISOR = 8
+CPU_OFFLOAD_BYTES = 64 * 1024            # larger bodies are normalized in a worker thread
+SIMILARITY_TRIVIAL_THRESHOLD = 0.98
+SIMILARITY_MAJOR_THRESHOLD = 0.80
+CONSOLE_PRIORITY_THRESHOLD = 40
+TOP_CHANGES_SHOWN = 10
+```
+
+- Memory per in-flight probe: ≤ 256 KB title head + ≤ `NORMALIZATION_MAX_BYTES` text buffer
+  (binary is never buffered). The queue holds at most `2 × concurrency` results, each with a
+  sketch of ≤ ~256 KB (typically a few KB).
+- CPU-heavy work stays off the event loop. Normalization of bodies > 64 KB runs in a worker thread.
+  Similarity runs in the DB thread, only when content changed, in linear time over a bounded
+  sketch.
+- Still one SQLite writer.
+
+## Tests
+
+```bash
+python -m pytest -q          # or: python -m unittest discover -s tests
+```
+
+82 offline tests use a local aiohttp server on `127.0.0.1`. They cover target identity, explicit
+HTTPS and fallback, per-probe cookies and cookie isolation, completeness, every normalization rule
+(including what must *not* be normalized), similarity, all delta classifications and transitions,
+priority ordering, binary responses, off-scope redirects, a v1-database refusal, and multi-run
+controlled-change scenarios.
+
+## Known limitations
+
+- **Normalization is conservative on purpose.** Tokens with unusual names, volatile values in free
+  text ("rendered in 12 ms"), rotating ads/recommendations and A/B variants still produce content
+  changes. Use `change_ratio` to spot such pages. Stripping HTML comments means a changed comment
+  only shows as "noise suppressed", even though the raw hash records it.
+- **Similarity ignores order** (multiset of chunks). Pure reordering scores as near-identical.
+  Similarity is not measured for binary bodies or text over `SIMILARITY_MAX_BYTES`, and those
+  changes are reported as `content_changed_major` with `magnitude: "unmeasured"`.
+- Sketches are stored only for the current baseline. Similarity against older history isn't possible.
+- Truncated bodies (`response_too_large`) are recorded but never content-compared.
+- Cookies are kept only within one redirect chain. There is no login or session automation.
+- Phase 1 databases are not migrated (see migration policy).
+- `review_priority` and `interesting` are deterministic heuristics, not vulnerability findings.
+- Scope is host-based. Ports and paths aren't restricted for redirects.
+
+---
+
+# Recon & Attack-Surface Mapping
+
+The recon subsystem (`shadow_scan/recon/`) turns ShadowScan from a change monitor into a
+persistent attack-surface intelligence system. It is layered on top of the monitoring engine and
+**reuses** its HTTP probing, fingerprints, scoring and single-writer SQLite design. Everything is
+bounded and intended for **authorized** bug-bounty recon: passive discovery, DNS, bounded
+service/URL discovery, safe crawling, static JavaScript analysis and deterministic correlation.
+There is **no** exploitation, brute force, credential attack, fuzzing, payload injection, DoS
+behaviour or GraphQL introspection.
+
+## Pipeline
+
+```
+discovery -> dns -> http -> services -> urls -> crawl -> javascript -> enrichment -> correlation
+```
+
+Each stage's status (`pending/running/completed/failed/skipped`) is stored in `recon_stages`, so a
+failed or interrupted run resumes with `--resume` and only re-runs incomplete stages. Scope is
+enforced before every active request.
+
+| Stage | What it does | Reuses / tools |
+|---|---|---|
+| discovery | seeds + passive subdomain tools, dedup, scope-classify, record source | subfinder/amass/findomain (optional) |
+| dns | async bounded resolution, A/AAAA/CNAME, transition events | stdlib getaddrinfo |
+| http | monitors resolved in-scope hosts | the monitoring `Scanner`, unchanged |
+| services | bounded port profiles, new/closed/changed ports | naabu/nmap (optional) |
+| urls | passive URL inventory, normalize + dedup + scope-classify | gau/waybackurls (optional) |
+| crawl | bounded, scope-safe GET crawl; links, JS URLs, tech, favicon, GraphQL | `HttpProber.fetch` |
+| javascript | fetch + analyze JS, source maps, findings | `HttpProber.fetch` |
+| enrichment | conventional OpenAPI specs, favicons | `HttpProber.fetch` |
+| correlation | combine signals into review items, noise-aware ranking | — |
+
+## Scope engine
+
+A first-class `ScopeEngine` classifies every discovered object as `IN_SCOPE`, `OUT_OF_SCOPE` or
+`UNKNOWN`, and **nothing out of scope is ever requested** (UNKNOWN only with `--probe-unknown`).
+Scope file syntax:
+
+```
+example.com                 # exact host
+*.example.com               # wildcard root (subdomains, not the apex)
+https://portal.example.com  # explicit URL -> host + scheme + port constraint
+!admin.example.com          # excluded host
+!~\.internal\.example\.com$ # excluded regex (prefix !~)
+@ports 80,443,8443          # allowed ports
+@scheme https               # allowed schemes
+```
+
+## Tool adapters
+
+External binaries sit behind adapters in `shadow_scan/recon/tools/`. Each adapter detects
+availability, builds a **subprocess argument array** (never a shell string, so target names cannot
+inject commands), runs with a timeout, and parses output. Missing or timed-out tools degrade
+gracefully (empty result, warning) and never abort a run. All adapters are optional.
+
+## Intelligence stored
+
+- **DNS** (`dns_records`): status, A/AAAA, CNAME, `changed_at`; events `new_subdomain`,
+  `dns_became_live/dead`, `cname_changed`, `ip_changed`, and a `dangling_cname` **review signal**
+  (never a takeover claim).
+- **Services** (`services`): host/port/proto/guess/banner/source; `new_open_port`, `closed_port`,
+  `service_changed`. New web ports score higher.
+- **URLs** (`urls`): normalized, deduped, scope-classified, with query parameter names. Historical
+  URLs are kept even when no longer live. Off-scope URLs are stored but never fetched.
+- **JavaScript** (`javascript_assets`, `js_findings`): raw SHA-256, size, source-map ref, and
+  layered findings — endpoints, routes, hostnames, params, config refs, **conservative** secret
+  candidates (shape + context based, with a false-secret filter), source maps. Events include
+  `js_changed`, `new_js_endpoint`, `new_secret_candidate`, `new_source_map`.
+- **Endpoints** (`endpoints`): identity `(host, METHOD, normalized_path)` with `{id}`/`{uuid}`
+  placeholders, so HTML/JS/history/OpenAPI collapse to one row. Method is `KNOWN`/`INFERRED`/
+  `UNKNOWN` and never assumed `GET`.
+- **Parameters** (`parameters`): name + location (`query/path/body/header/cookie/unknown`) +
+  endpoint + source. Sensitive names (`admin`, `role`, `redirect`, `token`, ...) raise review
+  priority — never a vulnerability claim.
+- **OpenAPI**: valid specs at conventional paths are parsed into endpoints/params/auth schemes;
+  a new spec is an interesting recon event. **GraphQL** endpoints are recorded as *candidates*
+  only (no introspection).
+- **Technologies** (`technologies`) and **favicons** (`favicons`): passive evidence only;
+  `technology_added/removed`, `version_changed`, `favicon_changed`.
+
+## Correlation, ranking and the review queue
+
+The correlation engine (`correlation.py`) combines an asset's signals into explainable
+`recon_signals` with a stable `rule_id`, reason and `review_priority` (0-100). Rules and weights
+are centralized. Examples: new live host + OpenAPI (96), revived host + new port (92), changed JS
+introducing an internal endpoint (91), new OpenAPI with many endpoints (90), new web port (80),
+new admin-ish subdomain (78). An interesting monitoring HTTP transition (e.g. 403->200) is carried
+through at its monitoring priority.
+
+**Noise-aware ranking:** on assets that change almost every run (high monitoring `change_ratio`),
+*generic content-change* signals are down-ranked — but structural attack-surface signals (new
+subdomain/port/endpoint/JS route/API doc) keep full weight.
+
+The `review_items` queue reflects each asset's **current** standing (priority, reason, underlying
+signals, `first_seen`, `latest_seen`, `status` in `new/reviewing/interesting/dismissed/resolved`).
+**"interesting" means the state transition may deserve human review — not that anything is
+vulnerable.**
+
+## Recon CLI
+
+```bash
+shadow_scan recon   --input scope.txt [--database shadowscan.db] [--resume]
+                    [--ports fast|web_extended|custom] [--max-depth N] [--max-urls N]
+                    [--no-external-tools] [--no-services] [--no-urls] [--no-crawl] [--no-javascript]
+shadow_scan review  --database shadowscan.db [--status new ...] [--set ASSET STATUS] [--summary]
+shadow_scan stats   --database shadowscan.db
+shadow_scan monitor --input domains.txt ...     # the HTTP monitor (also the bare, legacy form)
+```
+
+A bare `python -m shadow_scan.main --input domains.txt ...` still runs the monitor, unchanged.
+
+### Example review queue
+
+```
+Researcher review queue
+
+[ 92] api-new.example.com
+      - Previously dead host now resolves, exposes new port(s) [8443] and serves HTTP 200
+      - New API documentation exposes 27 previously unseen endpoints
+[ 91] portal.example.com
+      - Changed JavaScript introduced internal-looking endpoint(s): /api/internal/export
+      - New sensitive-looking parameter(s): account_id
+      - New JavaScript source map reference discovered
+[ 85] admin-dev.example.com
+      - Monitoring flagged an HTTP transition: Previously missing endpoint (404) now returns HTTP 200
+      - New web-facing port(s) exposed: [8443]
+```
+
+## Recon schema
+
+Recon tables are added to the same database additively (tracked by `recon_meta`, leaving the
+monitoring `user_version` untouched): `recon_runs`, `recon_stages`, `hosts`, `discovery_sources`,
+`dns_records`, `services`, `urls`, `javascript_assets`, `js_findings`, `endpoints`, `parameters`,
+`technologies`, `favicons`, `recon_signals`, `review_items`. The single-writer model is preserved:
+all writes go through one connection on one thread; the HTTP stage's monitoring `Scanner` has its
+own single writer thread and recon reads its results over WAL.
+
+## Recon performance
+
+Bounded everywhere: semaphore-limited DNS and JS fetching, a capped crawler (depth / per-host /
+total / frontier), size-limited reads, per-tool timeouts, batched inserts, and incremental history
+counters (no full-table history scans). Correlation does O(hosts) indexed lookups.
+
+## Recon known limitations
+
+- Passive discovery, port and URL tools are optional external binaries; without them, recon still
+  crawls and analyzes in-scope hosts. Those tools may reach third-party services — use
+  `--no-external-tools` for fully local/offline operation.
+- Secret detection is conservative and candidate-only; it can miss unusual tokens and is never a
+  confirmation.
+- JavaScript analysis is static string/pattern work (no JS execution, no AST dependency); heavily
+  obfuscated bundles yield fewer findings.
+- GraphQL support is candidate-recognition only; no introspection or active GraphQL testing.
+- Dangling CNAMEs, new API docs and similar are **review signals**, never vulnerability findings.
+- Source maps are fetched only from explicit `sourceMappingURL` references (or a configured
+  companion), under strict size limits — no path guessing.
