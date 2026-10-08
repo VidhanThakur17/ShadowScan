@@ -148,7 +148,7 @@ def run_monitor(argv: Sequence[str] | None = None) -> int:
 
 # --- recon / review / stats subcommands ------------------------------------------------
 
-_SUBCOMMANDS = ("monitor", "recon", "review", "stats")
+_SUBCOMMANDS = ("monitor", "recon", "review", "stats", "analyze", "findings")
 
 
 def run_recon(argv: Sequence[str]) -> int:
@@ -168,6 +168,16 @@ def run_stats(argv: Sequence[str]) -> int:
     return _run_stats(argv)
 
 
+def run_analyze(argv: Sequence[str]) -> int:
+    from .secanalysis.cli import run_analyze as _run_analyze
+    return _run_analyze(argv)
+
+
+def run_findings(argv: Sequence[str]) -> int:
+    from .secanalysis.cli import run_findings as _run_findings
+    return _run_findings(argv)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Dispatch to a subcommand. A bare invocation (no subcommand) runs monitor,
     preserving the Phase-1/2 ``--input domains.txt`` form."""
@@ -178,6 +188,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         command, rest = "monitor", args          # backward-compatible default
     dispatch = {
         "monitor": run_monitor, "recon": run_recon, "review": run_review, "stats": run_stats,
+        "analyze": run_analyze, "findings": run_findings,
     }
     return dispatch[command](rest)
 

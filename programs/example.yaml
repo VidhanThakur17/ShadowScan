@@ -1,0 +1,67 @@
+# ShadowScan program profile (example).
+#
+# One file per authorized bug-bounty / pentest program. The same ShadowScan
+# install can serve many programs; nothing here is applied globally.
+#
+# SECRETS ARE NEVER STORED HERE. Auth material is referenced by environment
+# variable name (token_env / cookie_env) and resolved at runtime; the loader
+# REJECTS any profile that inlines a token/cookie/secret/password value.
+
+name: example
+
+# Scope roots understood by the ScopeEngine (exact hosts, *.wildcards, URLs,
+# !exclusions, !~regex, @ports, @scheme). Also used as the default analyze scope.
+scope_roots:
+  - example.com
+  - "*.example.com"
+  - https://portal.example.com
+  - "@scheme https"
+
+excluded_hosts:
+  - admin.internal.example.com
+
+excluded_paths:
+  - "^/billing/"          # regex; endpoints matching are DISALLOWED for active testing
+
+allowed_ports: [80, 443, 8443]
+allowed_methods: [GET, HEAD, OPTIONS]   # only these may ever be auto-invoked
+
+# Global ceiling on all active testing. passive_only disables every active check.
+global_mode: safe_active
+
+# Bounded request controls, separate from recon.
+max_requests_per_run: 500
+max_requests_per_endpoint: 5
+requests_per_second_per_host: 2.0
+active_concurrency: 4
+
+# GraphQL introspection is OFF by default; enable only with explicit authorization.
+graphql_introspection: false
+
+# Conservative Nuclei template categories (never dos/intrusive/brute-force).
+nuclei_profiles: [passive, exposure, misconfig]
+
+# Optional researcher identification header the program may require.
+researcher_header:
+  name: X-Bug-Bounty
+  value: shadowscan-researcher
+
+# Authentication contexts for read-only access-control differential analysis.
+# token_env/cookie_env name an environment variable; set it before running.
+#   export EXAMPLE_VIEWER_TOKEN="Bearer ..."
+#   export EXAMPLE_ADMIN_TOKEN="Bearer ..."
+authentication_profiles:
+  - name: viewer
+    host: api.example.com
+    header_name: Authorization
+    token_env: EXAMPLE_VIEWER_TOKEN
+    description: low-privilege read-only user
+  - name: admin
+    host: api.example.com
+    header_name: Authorization
+    token_env: EXAMPLE_ADMIN_TOKEN
+    description: administrative user (provide your own authorized credentials)
+
+notes: >
+  Authorized testing only. ShadowScan performs passive and bounded SAFE_ACTIVE
+  checks; state-changing validation is emitted as manual packages, never executed.

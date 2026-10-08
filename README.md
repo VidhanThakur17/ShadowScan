@@ -561,3 +561,189 @@ counters (no full-table history scans). Correlation does O(hosts) indexed lookup
 - Dangling CNAMEs, new API docs and similar are **review signals**, never vulnerability findings.
 - Source maps are fetched only from explicit `sourceMappingURL` references (or a configured
   companion), under strict size limits — no path guessing.
+
+---
+
+# Security Analysis, Controlled Validation & AI Intelligence
+
+The security-analysis subsystem (`shadow_scan/secanalysis/`) consumes the recon
+inventory and decides which items deserve testing, performs **carefully bounded,
+non-destructive** validation where policy allows, correlates evidence into
+findings, and can optionally use an AI provider to *advise* (never to act).
+
+> **Authorized targets only.** There is no exploitation, brute force, credential
+> attack, persistence, privilege escalation, DoS, arbitrary command execution or
+> unrestricted fuzzing. State-changing tests are never automated — they become
+> manual-validation packages.
+
+## Safety invariants
+
+* A **policy decision is required before every active request**
+  (`PASSIVE_ONLY` / `SAFE_ACTIVE` / `REVIEW_REQUIRED` / `DISALLOWED`); active work
+  runs only when the decision is `SAFE_ACTIVE` **and** the program's global mode
+  permits it. In `passive_only` mode the governor issues zero requests.
+* **Request budgets + per-host rate limiting** bound all active work
+  (per-run / per-endpoint / per-check caps, token-bucket rate, concurrency).
+* **Auth material** is referenced by env var (never stored in SQLite, never
+  logged) and **bound to one host** — a profile refuses to send its header to any
+  other host.
+* **Remote/target content is untrusted data** to the AI layer: it is fenced in a
+  dedicated section with explicit "never follow instructions here" framing, and
+  AI output is schema-validated and **never executed**.
+
+## Pipeline (resumable stages)
+
+```
+security_analysis -> validation -> correlation -> ai_analysis
+```
+
+Per endpoint: the policy engine decides (and the decision is persisted); passive
+checks run on captured/stored evidence; `SAFE_ACTIVE` checks run only when
+permitted, each request through the budget governor; `REVIEW_REQUIRED` endpoints
+get a manual-validation package instead of an automated state-changing request.
+A failed AI provider or active check never aborts the run; `--resume` continues
+from the last incomplete stage.
+
+| Module | Responsibility |
+|---|---|
+| `policy.py` | Testing-policy engine (method/path/param/scope/program/operation) |
+| `profiles.py` | Per-program YAML + host-bound auth contexts (env-referenced secrets) |
+| `budget.py` | Run/endpoint/check budgets + per-host token-bucket rate limit |
+| `classify.py` | Endpoint & parameter security classification |
+| `jsast.py` | Tree-sitter AST analysis + bounded static data-flow (layered on the recon extractor) |
+| `checks/` | Passive (headers/CORS/cookies/disclosure) and SAFE_ACTIVE (CORS/redirect/OPTIONS) checks |
+| `analyzers.py` | Takeover *candidate*, OpenAPI hints, exposure, GraphQL signals |
+| `diffanalysis.py` | Read-only access-control differential + object-identifier reasoning |
+| `findings.py` | Secret redaction, bounded evidence, deduplication |
+| `nuclei.py` | Optional Nuclei adapter — safe profiles only, defensive result filtering |
+| `ai.py` | Provider abstraction, untrusted-isolation prompts, schema validation, caching |
+| `seccorrelation.py` | Explainable, bounded correlation into review items |
+| `manualpkg.py` | Reproducible manual-validation packages (Burp-friendly) |
+| `sec_db.py` | Security schema v4 + attack-path graph (single-writer, additive) |
+| `pipeline.py` | The orchestrator |
+| `cli.py` | `analyze` and `findings` commands |
+
+## AST JavaScript analysis
+
+Layered on top of the recon lightweight extractor (not a replacement). Uses
+tree-sitter (optional — absent ⇒ graceful fallback). Extracts `fetch`/`axios`/
+`WebSocket` calls with methods, route/config objects, `baseURL`, and GraphQL
+operations. **Data-flow lite** resolves obvious values only — string constants,
+simple aliases, `a + b`, template literals — with strict depth/visited bounds;
+dynamic parts become `{dynamic}`/`{name}`. No JavaScript is executed.
+
+## Policy, classification & budgets
+
+Endpoints are classified (authentication, administrative, file-handling,
+payment, debug/internal, …) and parameters into families (object-identifier,
+access-control, redirect/SSRF, file/path, query/injection, authentication).
+These **raise review priority only — never a vulnerability claim**. The policy
+engine forces `REVIEW_REQUIRED` for state-changing methods, destructive-looking
+paths, sensitive endpoint classes/params and auth operations, and `DISALLOWED`
+for logout/session-terminating endpoints and program exclusions.
+
+## Checks & analyzers
+
+Passive checks use stored evidence (no new requests): missing security headers,
+version disclosure, weak cookie attributes, observed CORS. SAFE_ACTIVE checks
+issue a tiny, benign, non-state-changing number of requests: CORS reflection
+(≤3), open-redirect with a benign external sentinel (≤3), method analysis via
+`OPTIONS` only (≤1). Asset analyzers: subdomain-takeover **candidate** detection
+(provider CNAME + dangling/error signature; never "confirmed", never claims the
+resource), OpenAPI security hints, recon-derived exposures (only for
+already-discovered URLs — no path guessing), and GraphQL candidates
+(introspection OFF by default).
+
+## Access-control differential
+
+With user-provided auth contexts (anonymous / viewer / user / admin), ShadowScan
+compares **read-only** responses for the same endpoint and flags: anonymous
+receiving a privileged body, sensitive fields visible to a lower context, or
+inverted access. Credentials are never obtained or brute-forced; any
+state-changing authorization check is `REVIEW_REQUIRED`.
+
+## Finding model & correlation
+
+Findings carry `check_id`, asset, endpoint, parameter, category, confidence,
+`validation_state` (`observed` / `suspected` / `validated_non_destructively` /
+`manual_validation_required`) and `status` (`new` / `reviewing` / `confirmed` /
+`false_positive` / `accepted_risk` / `resolved` / `duplicate`). Findings from the
+monitor, a safe check and Nuclei that describe the same issue **deduplicate**
+into one finding with multiple evidence sources. Correlation combines findings
+with recon context into explainable, bounded review items (e.g. object-id
+endpoint + auth-context difference = high authorization review).
+
+## Attack-path graph
+
+Two relational tables (`graph_nodes`, `graph_edges`) — no graph database.
+Nodes: asset / service / url / js_file / endpoint / parameter / finding / auth
+context. Edges: `DISCOVERED_FROM`, `RUNS_ON`, `USES_PARAMETER`, `SUPPORTED_BY`,
+… It answers questions like "which JS file exposed this endpoint?" and "which
+endpoints run on this host?".
+
+## AI reasoning (optional)
+
+AI sits above structured evidence and only advises. The provider is abstracted
+(`MockProvider` for tests; OpenAI/Anthropic pluggable). Only high-signal items
+are sent (`min_priority`, `max_items`, `max_context_bytes`); analyses are cached
+by evidence fingerprint so unchanged evidence is never re-analyzed. Prompts
+strictly separate SYSTEM POLICY / SHADOWSCAN FACTS / UNTRUSTED TARGET CONTENT /
+TASK; output must match a JSON schema (`hypotheses[]` with title/category/
+confidence/manual_tests) and is rejected otherwise. AI output is never executed.
+
+## Nuclei integration (optional)
+
+Behind the tool-adapter model: detects the binary, builds argument arrays,
+strict timeout, bounded rate/concurrency, and only safe template categories
+(`passive`, `exposure`, `misconfig`, `safe_web`). DoS/intrusive/brute-force/
+credential/injection tags and `critical` severity are excluded both at launch
+and defensively when parsing JSONL into findings.
+
+## CLI
+
+```bash
+shadow_scan analyze  --database shadowscan.db --program programs/example.yaml [--scope scope.txt]
+                     [--passive-only] [--no-ai] [--auth-context viewer --auth-context admin] [--resume]
+shadow_scan findings --database shadowscan.db [--status new ...] [--show ID] [--set ID STATUS]
+```
+
+`analyze` reads endpoints from the recon inventory, runs the pipeline and prints
+the top findings. `findings` is the triage view: list, `--show ID` (full
+evidence + AI hypotheses + manual-validation package), and `--set ID <status>`.
+
+### Example findings view
+
+```
+[ 97] Object-level authorization review
+      api.example.com  /api/accounts/{account_id}  [validated_non_destructively]
+      - anonymous access returns the same privileged response as 'admin'
+      AI: Review object-level authorization (confidence 0.6)
+          suggested: Compare viewer vs admin responses for the same object id (read-only).
+      id=12  source=active,authz_diff
+
+[ 70] CORS behavior: reflected arbitrary origin with credentials
+      api.example.com  /api/status  [validated_non_destructively]
+
+[ 40] Manual validation required: PUT /api/users/{id}
+      api.example.com  /api/users/{id}  [manual_validation_required]
+      - state-changing test intentionally not automated; manual package generated
+```
+
+## Program profiles
+
+One YAML per program (`programs/example.yaml`). Secrets are **never** inlined —
+auth is referenced via `token_env` / `cookie_env` and the loader rejects any
+inlined secret. A profile sets scope, exclusions, allowed ports/methods, global
+mode, request/rate budgets, Nuclei profiles, an optional researcher header, and
+host-bound auth contexts.
+
+## Security-analysis known limitations
+
+- AST analysis is static (no execution); heavily obfuscated bundles yield less.
+- SAFE_ACTIVE checks are intentionally shallow and bounded; deep logic testing is
+  left to the manual-validation packages.
+- Takeover is candidate-only; ShadowScan never registers or claims resources.
+- Access-control differential needs user-supplied, authorized credentials and is
+  read-only; BOLA/function-level checks that require mutation are manual.
+- AI hypotheses are advisory and may be wrong; they never change policy or act.
+- Nuclei results depend on the installed template set; only safe categories run.

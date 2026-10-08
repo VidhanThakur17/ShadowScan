@@ -191,7 +191,8 @@ class HttpProber:
             await self._session.close()
             self._session = None
 
-    async def fetch(self, url: str, *, max_bytes: int | None = None) -> FetchResult:
+    async def fetch(self, url: str, *, max_bytes: int | None = None,
+                    headers: dict[str, str] | None = None) -> FetchResult:
         """Fetch one in-scope URL's bounded body for recon analysis.
 
         Reuses the shared pooled session, timeouts, size cap and per-request
@@ -205,7 +206,7 @@ class HttpProber:
         result = FetchResult(url=url)
         try:
             # The session's DummyCookieJar keeps this stateless; no cookies persist across fetches.
-            async with self._session.get(url, allow_redirects=False) as response:
+            async with self._session.get(url, allow_redirects=False, headers=headers or None) as response:
                 result.status_code = response.status
                 result.final_url = str(response.url)
                 result.content_type = response.headers.get("Content-Type")
