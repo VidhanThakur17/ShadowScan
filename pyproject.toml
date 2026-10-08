@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shadowscan"
+version = "0.4.0"
+description = "ShadowScan — bug-bounty attack-surface monitoring, recon, bounded security analysis and continuous operations (authorized testing only)."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "ShadowScan" }]
+keywords = ["bug-bounty", "recon", "attack-surface", "security", "monitoring"]
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Topic :: Security",
+]
+
+dependencies = [
+    "aiohttp>=3.11,<4",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+ast = ["tree-sitter>=0.23", "tree-sitter-javascript>=0.23"]
+dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[project.scripts]
+shadowscan = "shadow_scan.main:main"
+
+[tool.setuptools]
+packages = [
+    "shadow_scan",
+    "shadow_scan.recon",
+    "shadow_scan.recon.tools",
+    "shadow_scan.secanalysis",
+    "shadow_scan.secanalysis.checks",
+    "shadow_scan.ops",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::pytest.PytestCollectionWarning"]

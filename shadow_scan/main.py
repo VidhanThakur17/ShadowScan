@@ -148,7 +148,8 @@ def run_monitor(argv: Sequence[str] | None = None) -> int:
 
 # --- recon / review / stats subcommands ------------------------------------------------
 
-_SUBCOMMANDS = ("monitor", "recon", "review", "stats", "analyze", "findings")
+_SUBCOMMANDS = ("monitor", "recon", "review", "stats", "analyze", "findings",
+                "program", "run", "db", "feedback", "ignore", "baseline", "schedule")
 
 
 def run_recon(argv: Sequence[str]) -> int:
@@ -178,6 +179,41 @@ def run_findings(argv: Sequence[str]) -> int:
     return _run_findings(argv)
 
 
+def run_program(argv: Sequence[str]) -> int:
+    from .ops.cli import run_program as _f
+    return _f(argv)
+
+
+def run_run(argv: Sequence[str]) -> int:
+    from .ops.cli import run_run as _f
+    return _f(argv)
+
+
+def run_db(argv: Sequence[str]) -> int:
+    from .ops.cli import run_db as _f
+    return _f(argv)
+
+
+def run_feedback(argv: Sequence[str]) -> int:
+    from .ops.cli import run_feedback as _f
+    return _f(argv)
+
+
+def run_ignore(argv: Sequence[str]) -> int:
+    from .ops.cli import run_ignore as _f
+    return _f(argv)
+
+
+def run_baseline(argv: Sequence[str]) -> int:
+    from .ops.cli import run_baseline as _f
+    return _f(argv)
+
+
+def run_schedule(argv: Sequence[str]) -> int:
+    from .ops.cli import run_schedule as _f
+    return _f(argv)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Dispatch to a subcommand. A bare invocation (no subcommand) runs monitor,
     preserving the Phase-1/2 ``--input domains.txt`` form."""
@@ -189,6 +225,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     dispatch = {
         "monitor": run_monitor, "recon": run_recon, "review": run_review, "stats": run_stats,
         "analyze": run_analyze, "findings": run_findings,
+        "program": run_program, "run": run_run, "db": run_db,
+        "feedback": run_feedback, "ignore": run_ignore, "baseline": run_baseline,
+        "schedule": run_schedule,
     }
     return dispatch[command](rest)
 

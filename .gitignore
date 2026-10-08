@@ -1,0 +1,59 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- ShadowScan runtime workspaces (databases, logs, exports, reports) ---
+# Program *config* under programs/ is committed; runtime state is not.
+runtime/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+shadowscan.db*
+
+# Scan output / transient evidence / logs
+logs/
+*.log
+exports/
+reports/
+crawl_bodies/
+scratch/
+tmp/
+
+# --- Secrets & credentials (NEVER commit) ---
+.env
+.env.*
+!.env.example
+*secret*.yaml
+*secrets*.yaml
+auth.*.yaml
+!auth.example.yaml
+*.pem
+*.key
+credentials*.json
+*.token
+
+# --- AI cache that may hold target-derived content ---
+ai_cache/
+*.aicache
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

@@ -747,3 +747,246 @@ host-bound auth contexts.
   read-only; BOLA/function-level checks that require mutation are manual.
 - AI hypotheses are advisory and may be wrong; they never change policy or act.
 - Nuclei results depend on the installed template set; only safe categories run.
+
+---
+
+# Continuous Operations, Program Management, Reporting & Production Hardening
+
+The operations layer (`shadow_scan/ops/`) turns ShadowScan into a daily platform.
+It orchestrates the existing monitoring, recon and security-analysis subsystems —
+it does not reimplement them — and preserves scope enforcement, policy
+enforcement and the single SQLite writer. No automatic exploitation, no automatic
+report submission.
+
+Lifecycle: **program → scope → recon → historical comparison → security analysis
+→ correlation → AI assistance → research queue → manual validation → finding
+management → reporting → continuous monitoring → researcher feedback → next run.**
+
+## Packaging & commands
+
+Installable via `pyproject.toml` with a `shadowscan` console entry point
+(`python -m shadow_scan` and `python -m shadow_scan.main` remain compatible):
+
+```bash
+pip install -e .            # or: pip install -e ".[ast,dev]"
+shadowscan program list
+shadowscan program create acme --platform hackerone
+shadowscan program validate acme
+shadowscan run acme [--resume] [--force] [--insecure]
+shadowscan program stats acme
+shadowscan findings list --status new
+shadowscan db stats|vacuum|integrity|backup|export|import -d runtime/acme/shadowscan.db
+shadowscan feedback -d <db> --program acme --kind category --key cookie_security --verdict noise
+shadowscan ignore   -d <db> --program acme --add path "*/analytics/*"
+shadowscan baseline -d <db> --program acme --add endpoint api.example.com/status "403 expected"
+shadowscan schedule acme        # prints Windows/cron/systemd examples
+```
+
+## Program workspace model
+
+Config is committed; runtime state (databases, logs, exports, reports) is
+git-ignored and isolated per program:
+
+```
+programs/acme/program.yaml  scope.yaml  ignore.yaml  auth.example.yaml
+runtime/acme/shadowscan.db  logs/  exports/  reports/  run.lock
+```
+
+Secrets never live in committed files: auth is referenced by env-var name and
+resolved at runtime, bound to a single host, and never stored in SQLite, exports,
+logs or notifications. Configuration precedence is
+`defaults < global < program < env < CLI`, and a **more restrictive security
+policy always wins** (env/global can tighten `global_mode` but a CLI loosening
+cannot override a stricter env setting).
+
+## Unified run
+
+`shadowscan run <program>` executes only the stages enabled in the profile:
+`preflight → discovery → dns → monitor → services → urls → crawl → javascript →
+enrichment → correlation → security_analysis → validation → ai_analysis → review
+→ reporting → notifications`. It acquires a program **run lock** (PID + heartbeat,
+stale-detection, `--force` recovery), runs **preflight** (Python/DB/config/parsers/
+tool health/AI config/writable dirs — no target interaction, degraded mode for
+missing optional tools), reuses the existing resumable pipelines, then performs
+lifecycle/regression bookkeeping, notifications, the run summary and reports.
+
+## Incremental, retry, guardrails, graceful shutdown
+
+- **Incremental:** per-object evidence fingerprints (`ops_fingerprints`) skip
+  unchanged JS/OpenAPI/endpoint/favicon work; each scheduled task records *why*
+  (new/changed/forced).
+- **Retry:** centralized classification (timeouts/SERVFAIL retryable; NXDOMAIN/403/
+  invalid-URL not; policy-denied never) with bounded exponential backoff + jitter —
+  no infinite loops.
+- **Guardrails:** `MAX_TOTAL_REQUESTS/BYTES/URLS/JS_FILES/AST_BYTES/SECURITY_CHECKS/
+  AI_CALLS/RUNTIME` and a disk-space floor; on breach the component stops cleanly,
+  is marked limited, and partial results are preserved.
+- **Graceful shutdown:** Ctrl+C stops scheduling, lets the DB writer flush, closes
+  sessions, marks the run `interrupted` and stays resumable.
+
+## Migrations, backup, export/import
+
+A lightweight ordered, transactional **migration framework** (`schema_migrations`)
+coexists with the per-subsystem schema initializers. Databases are migrated, never
+deleted. `db backup` uses SQLite's online backup API (never a naive copy).
+`db export` writes a versioned JSON envelope of program intelligence that **never
+contains secrets** (secret-ish columns are excluded and import validation rejects
+any that appear). Retention trims only bulky transient rows, never core findings.
+
+## Researcher feedback, ignore rules, baselines
+
+Deterministic, bounded ranking (no ML): repeated dismissals/"noise" lower a
+category/endpoint's priority within `±25`, repeated "interesting"/"confirmed"
+raise it. Ignore rules and baselines suppress repetitive noise (and show *why* a
+finding was suppressed) but never delete evidence and **never hide structural
+attack-surface changes** (new host/endpoint/port/JS route/API doc, takeover,
+authorization). Nothing here can override scope or safety policy.
+
+## Finding lifecycle & regression
+
+States: `new → triaged → investigating → confirmed → reported`,
+`confirmed → resolved`, plus `duplicate/informative/false_positive/archived`.
+Every transition is a non-destructive timeline event. In continuous runs, a
+confirmed/reported finding absent from a later run is auto-**resolved**; if it
+reappears it is a **regression** — the *same lineage* is reopened (high priority),
+never a new duplicate.
+
+## Reporting & report safety
+
+JSON and Markdown run reports and researcher-ready finding drafts (HackerOne /
+Bugcrowd / generic formatters). Reports are built from stored, **redacted**
+evidence and always distinguish *observed fact* vs *automated hypothesis* vs
+*non-destructive validation* vs *manual confirmation*. AI hypotheses are labeled
+advisory and are **never** presented as confirmed vulnerabilities; impact is never
+fabricated ("manual validation required" when not established).
+
+## Notifications
+
+Providers: console / file / webhook (stdlib only, degrades offline). Events are
+structured (`NEW_HIGH_PRIORITY_REVIEW_ITEM`, `NEW_VALIDATED_FINDING`,
+`AUTHORIZATION_REVIEW_REQUIRED`, `TAKEOVER_CANDIDATE`, `FINDING_REGRESSED`,
+`RUN_COMPLETED`, …), filtered per program (`notify_min_priority` + categories),
+deduplicated across runs, and **redacted** — no auth headers, no secrets; webhooks
+carry only what identifies the issue. Low-value events default to the run summary.
+
+## Scheduling (Windows first-class)
+
+`shadowscan schedule <program>` prints ready-to-use examples. ShadowScan does not
+run an always-on daemon; the OS scheduler invokes a bounded `run` protected by the
+run lock, so overlapping schedules cannot collide. Example (Windows Task Scheduler):
+
+```
+schtasks /Create /TN "ShadowScan\acme-monitor" /SC HOURLY /MO 4 ^
+  /TR "python -m shadow_scan run acme --resume" /RL LIMITED /F
+schtasks /Create /TN "ShadowScan\acme-daily" /SC DAILY /ST 03:30 ^
+  /TR "python -m shadow_scan run acme" /RL LIMITED /F
+```
+
+cron and systemd-timer equivalents are printed too. WSL is not required.
+
+## Examples
+
+### Example program workspace
+```
+programs/acme/
+  program.yaml      # mode, stages, budgets, notify, formatter
+  scope.yaml        # scope_roots / excluded_hosts
+  ignore.yaml       # ignore/baseline seeds
+  auth.example.yaml # env-referenced auth contexts (copy to auth.yaml, git-ignored)
+runtime/acme/
+  shadowscan.db  logs/  exports/  reports/  run.lock
+```
+
+### Example run summary
+```
+ShadowScan — acme
+
+Run status: completed
+
+  Hosts known:                      4,281
+  Resolving:                        3,902
+  URLs:                            87,203
+  JS assets:                          612
+  Endpoints:                        5,140
+  Security findings:                   14
+  Manual review required:               8
+  Validated non-destructively:          3
+  Regressions:                          1
+  Resolved this run:                    2
+
+Top items:
+  [ 98] Possible authorization boundary (api.acme.com)
+  [ 94] CORS behavior: reflected arbitrary origin with credentials (app.acme.com)
+  [ 91] Previously NXDOMAIN admin host became live (admin-dev.acme.com)
+
+Reports:
+  runtime/acme/reports/run-20261008T2030.md
+Notifications sent: 4
+```
+
+### Example review queue
+```
+[ 98] Object-level authorization review   api.acme.com  GET /api/accounts/{account_id}
+      [validated_non_destructively]  status: confirmed
+      - anonymous and viewer receive differing privileged responses
+      - account_id is a client-controlled object identifier
+      AI: Possible BOLA (confidence 0.62) — compare viewer/admin for same id (read-only)
+[ 91] New internal export endpoint         app.acme.com  GET /api/internal/export
+      [observed]  status: new
+      - introduced by a changed JS bundle; account_id parameter present
+```
+
+### Example finding report (Markdown, HackerOne formatter)
+```
+# Possible authorization boundary
+
+- **Asset:** api.acme.com
+- **Endpoint:** /api/accounts/{account_id}
+- **Category:** authorization
+- **Confidence:** 0.62
+- **Validation:** Validated non-destructively (automated, read-only)
+- **Status:** confirmed
+
+## Summary
+Assembled by ShadowScan from stored evidence. Automated hypotheses are advisory
+and are not confirmed vulnerabilities.
+
+## Evidence
+- `E1` [diff] anonymous and admin responses are identical across a trust boundary
+
+## Steps To Reproduce
+> Suggested, non-destructive manual steps. ShadowScan performs no state-changing tests.
+- Request shape: `GET /api/accounts/{account_id}`
+- Required auth context: viewer
+- Compare viewer vs admin responses for the same object id (read-only).
+
+## Impact
+Impact confirmed by manual researcher validation (see timeline).
+```
+
+### Example notification (redacted JSON webhook payload)
+```json
+{"event": "authorization_review_required", "program": "acme",
+ "title": "Object-level authorization review", "priority": 98,
+ "category": "authorization", "asset": "api.acme.com",
+ "detail": {"status": 200}}
+```
+
+### Example regression event (timeline)
+```
+2026-10-01T03:30Z  observed            first observation
+2026-10-03T03:30Z  status:confirmed    investigating -> confirmed
+2026-10-05T03:30Z  status:resolved     not observed this run (likely fixed)
+2026-10-08T03:30Z  finding_regressed   previously resolved finding observed again
+```
+
+## Production known limitations
+
+- The unified run reuses the existing pipelines; very large programs should tune
+  the per-program budgets/limits and schedule incremental runs frequently.
+- The run lock is per program workspace; it does not coordinate across different
+  machines sharing a network path (use one scheduler host per program).
+- Notification providers beyond console/file/webhook (Slack/Discord/email) are
+  intentionally left as thin future additions.
+- Docker is optional and not required; Windows-native execution is first-class.
+- Feedback adjusts ranking only and is bounded; it never changes scope or policy.
